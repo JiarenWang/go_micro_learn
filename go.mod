@@ -1,6 +1,5 @@
-module gobone
+module go_micro
 
 go 1.14
 
-require (
-)
+require github.com/go-kit/kit v0.10.0
