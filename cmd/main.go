@@ -2,121 +2,69 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"log"
+	"flag"
 	"net/http"
+	"os"
 
-	"github.com/go-kit/kit/endpoint"
+	stdprometheus "github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/go-kit/kit/log"
+	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	httptransport "github.com/go-kit/kit/transport/http"
 )
 
-// StringService 服务的定义
-type StringService interface {
-	hello(string) (string, error)
-	count(string) int
-}
-
-// 服务的具体实现者
-type stringService struct {
-}
-
-func (stringService) hello(s string) (string, error) {
-	if s == "" {
-		return "", ErrEmpty
-	}
-	return "hello" + s, nil
-}
-
-func (stringService) count(string) int {
-	return 100
-}
-
-//服务数据的结构,为什么需要这个??因为rpc??
-type helloRequest struct {
-	S string `json:"s"`
-}
-
-type helloResponse struct {
-	V   string `json:"v"`
-	ERR string `json:"err,omitempty"`
-}
-
-type countRequest struct {
-	S string `json:"s"`
-}
-
-type countResponse struct {
-	V int `json:"v"`
-}
-
-//服务数据的结构,为什么需要这个??因为rpc??
-
-//相当于对服务的具体实现做了一层封装
-//端点??? 参数为实现服务的结构体,返回一个端点,端点是方法类型, 请求转化成结构体,从结构体获取请求数据
-func makeHelloEndpoint(svc StringService) endpoint.Endpoint {
-	return func(_ context.Context, request interface{}) (interface{}, error) {
-		req := request.(helloRequest)
-		v, err := svc.hello(req.S)
-		if err != nil {
-			return helloResponse{v, err.Error()}, nil
-		}
-		return helloResponse{v, ""}, nil
-	}
-}
-
-//相当于对服务的具体实现做了一层封装
-//端点??? 参数为实现服务的结构体,返回一个端点,端点是方法类型, 请求转化成结构体,从结构体获取请求数据
-func makeCountEndpoint(svc StringService) endpoint.Endpoint {
-	return func(_ context.Context, request interface{}) (interface{}, error) {
-		req := request.(countRequest)
-		v := svc.count(req.S)
-		return countResponse{v}, nil
-	}
-}
-
-// ErrEmpty 空字符串
-var ErrEmpty = errors.New("Empty string")
-
 func main() {
-	//服务实现者
-	svc := stringService{}
+	var (
+		listen = flag.String("listen", ":8080", "HTTP listen address")
+		proxy  = flag.String("proxy", "", "Optional comma-separated list of URLs to proxy uppercase requests")
+	)
+	flag.Parse()
 
-	//某个服务的handel
+	var logger log.Logger
+	logger = log.NewLogfmtLogger(os.Stderr)
+	logger = log.With(logger, "listen", *listen, "caller", log.DefaultCaller)
+
+	fieldKeys := []string{"method", "error"}
+	requestCount := kitprometheus.NewCounterFrom(stdprometheus.CounterOpts{
+		Namespace: "my_group",
+		Subsystem: "string_service",
+		Name:      "request_count",
+		Help:      "Number of requests received.",
+	}, fieldKeys)
+	requestLatency := kitprometheus.NewSummaryFrom(stdprometheus.SummaryOpts{
+		Namespace: "my_group",
+		Subsystem: "string_service",
+		Name:      "request_latency_microseconds",
+		Help:      "Total duration of requests in microseconds.",
+	}, fieldKeys)
+	countResult := kitprometheus.NewSummaryFrom(stdprometheus.SummaryOpts{
+		Namespace: "my_group",
+		Subsystem: "string_service",
+		Name:      "count_result",
+		Help:      "The result of each count method.",
+	}, []string{})
+
+	var svc StringService
+	svc = stringService{}
+	svc = proxyingMiddleware(context.Background(), *proxy, logger)(svc)
+	svc = loggingMiddleware(logger)(svc)
+	svc = instrumentingMiddleware(requestCount, requestLatency, countResult)(svc)
+
 	uppercaseHandler := httptransport.NewServer(
-		makeHelloEndpoint(svc),
+		makeUppercaseEndpoint(svc),
 		decodeUppercaseRequest,
 		encodeResponse,
 	)
-
-	//某个服务的handel
 	countHandler := httptransport.NewServer(
 		makeCountEndpoint(svc),
 		decodeCountRequest,
 		encodeResponse,
 	)
-	//路由注册
-	http.Handle("/hello", uppercaseHandler)
+
+	http.Handle("/uppercase", uppercaseHandler)
 	http.Handle("/count", countHandler)
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func decodeUppercaseRequest(_ context.Context, r *http.Request) (interface{}, error) {
-	var request helloRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		return nil, err
-	}
-	return request, nil
-}
-
-func decodeCountRequest(_ context.Context, r *http.Request) (interface{}, error) {
-	var request countRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		return nil, err
-	}
-	return request, nil
-}
-
-func encodeResponse(_ context.Context, w http.ResponseWriter, response interface{}) error {
-	return json.NewEncoder(w).Encode(response)
+	http.Handle("/metrics", promhttp.Handler())
+	logger.Log("msg", "HTTP", "addr", *listen)
+	logger.Log("err", http.ListenAndServe(*listen, nil))
 }
